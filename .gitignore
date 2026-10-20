@@ -1,0 +1,3 @@
+# Build output (the release zip ships OpenCaptureLinkCamera.dll; build it with src\camera\build.cmd)
+/OpenCaptureLinkCamera.dll
+/src/camera/out/
