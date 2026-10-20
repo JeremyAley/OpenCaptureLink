@@ -106,6 +106,11 @@ namespace OpenCaptureLink {
     }
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+
+    // Deletes a file or empty folder at the next restart (MOVEFILE_DELAY_UNTIL_REBOOT).
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool MoveFileEx(string from, string to, int flags);
+    public static bool DeleteAtRestart(string path) { return MoveFileEx(path, null, 4); }
   }
 
   // Windows 11 virtual cameras (mfvirtualcamera.h). Lifetime System and access AllUsers: the
@@ -242,29 +247,57 @@ function Install-CameraDll {
   $source = Join-Path $PSScriptRoot $CameraDllName
   $target = Join-Path $CameraDir $CameraDllName
   [void](New-Item -ItemType Directory -Force $CameraDir)
-  Get-ChildItem $CameraDir -Filter '*.old' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  foreach ($old in @(Get-ChildItem $CameraDir -Filter '*.old' -ErrorAction SilentlyContinue)) {
+    try { Remove-Item $old.FullName -Force } catch { [void][OpenCaptureLink.Devices]::DeleteAtRestart($old.FullName) }
+  }
   if (-not (Test-Path $target) -or (Get-FileHash $source).Hash -ne (Get-FileHash $target).Hash) {
     if (Test-Path $target) {
-      try { Remove-Item $target -Force } catch { Move-Item $target "$target.$([DateTime]::Now.Ticks).old" -Force }
+      try { Remove-Item $target -Force }
+      catch {
+        $aside = "$target.$([DateTime]::Now.Ticks).old"
+        Move-Item $target $aside -Force
+        [void][OpenCaptureLink.Devices]::DeleteAtRestart($aside)
+      }
     }
     Copy-Item $source $target
   }
 
+  # Any user can create folders in ProgramData, so don't trust one that is already there: drop
+  # a junction, then take ownership and set the permissions outright.
+  $existing = Get-Item $CameraLogDir -Force -ErrorAction SilentlyContinue
+  if ($existing -and ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) { [IO.Directory]::Delete($CameraLogDir) }
   [void](New-Item -ItemType Directory -Force $CameraLogDir)
-  $acl = Get-Acl $CameraLogDir
-  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    (New-Object System.Security.Principal.SecurityIdentifier($LocalServiceSid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+  $acl = New-Object System.Security.AccessControl.DirectorySecurity
+  $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))  # Administrators
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($rule in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'), @($LocalServiceSid, 'Modify'))) {
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      (New-Object System.Security.Principal.SecurityIdentifier($rule[0])), $rule[1], 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+  }
   Set-Acl $CameraLogDir $acl
+  Get-ChildItem $CameraLogDir -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint -or $_.LinkType -eq 'HardLink' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
   $target
 }
 
-# Removes the DLL once no Media Foundation link needs it. If a process still has it loaded
-# (Windows' camera service, or any app that listed DirectShow cameras, since DirectShow lists
-# virtual cameras by loading them), it stays until the next restart.
+# Removes the DLL once no Media Foundation link needs it. A process may still have it loaded
+# (Windows' camera service, or any app that listed DirectShow cameras, this script included,
+# since DirectShow lists virtual cameras by loading them). Then it is moved aside, so a new
+# link can install a fresh copy, and deleted at the next restart.
 function Uninstall-CameraDll {
   if (@(Get-Links 'AllUsers' | Where-Object Type -eq 'MediaFoundation').Count) { return }
-  Get-ChildItem $CameraDir -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-  try { [IO.Directory]::Delete($CameraDir) } catch { }  # only if empty
+  foreach ($file in @(Get-ChildItem $CameraDir -File -ErrorAction SilentlyContinue)) {
+    try { Remove-Item $file.FullName -Force }
+    catch {
+      $aside = $file.FullName
+      if ($file.Extension -ne '.old') {
+        $aside = "$($file.FullName).$([DateTime]::Now.Ticks).old"
+        try { Move-Item $file.FullName $aside -Force } catch { $aside = $file.FullName }
+      }
+      [void][OpenCaptureLink.Devices]::DeleteAtRestart($aside)
+    }
+  }
+  try { [IO.Directory]::Delete($CameraDir) } catch { [void][OpenCaptureLink.Devices]::DeleteAtRestart($CameraDir) }
 }
 
 function Set-Link($device, [string]$scope, [string]$type) {
@@ -312,20 +345,28 @@ function Set-Link($device, [string]$scope, [string]$type) {
   }
 }
 
-# Gives a device a link of one type, then removes its link of the other type (DirectShow in
-# this scope, or Media Foundation): a Media Foundation link already shows up in DirectShow apps,
-# so both would list the device twice there.
+# Gives a device a link of one type, then removes its links of the other type (DirectShow in
+# either scope, or Media Foundation): a Media Foundation link already shows up in DirectShow
+# apps, so both would list the device twice there. Returns the removed links.
 function Set-DeviceLink($device, [string]$scope, [string]$type) {
-  $others = @(Get-Links $scope | Where-Object { $_.Type -eq 'DirectShow' -and $_.DeviceId -eq $device.Id }) +
-            @(Get-Links 'AllUsers' | Where-Object { $_.Type -eq 'MediaFoundation' -and $_.DeviceId -eq $device.Id }) |
-            Where-Object Type -ne $type
+  $others = @(@(Get-Links 'AllUsers') + @(Get-Links 'CurrentUser') |
+              Where-Object { $_.DeviceId -eq $device.Id -and $_.Type -ne $type })
+  if (-not (Test-Admin) -and ($others | Where-Object Scope -eq 'AllUsers')) {
+    throw "$($device.Name) has a $(Get-LinkLabel ($others | Where-Object Scope -eq 'AllUsers' | Select-Object -First 1)) link. Switching it needs PowerShell running as administrator."
+  }
   Set-Link $device $scope $type
   foreach ($link in $others) { Remove-Link $link; $link }
 }
 
 function Remove-Link($link) {
   if ($link.Type -eq 'MediaFoundation') {
-    try { [OpenCaptureLink.VirtualCamera]::Remove($link.Name, $link.Id) } catch { Write-Warning "$($link.Name): $($_.Exception.Message)" }
+    try { [OpenCaptureLink.VirtualCamera]::Remove($link.Name, $link.Id) }
+    catch {
+      # No answer: the camera may still exist, so keep what is needed to remove it later. Any
+      # other failure means Windows has no such camera (any more); finish cleaning up.
+      if ($_.Exception.GetBaseException() -is [TimeoutException]) { throw }
+      Write-Warning "$($link.Name): $($_.Exception.GetBaseException().Message)"
+    }
     $root = Open-Root 'AllUsers' 'Registry64'
     try {
       $root.DeleteSubKeyTree("$ClassesPath\$($link.Id)", $false)

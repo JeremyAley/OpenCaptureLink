@@ -122,11 +122,13 @@ struct Format {
   UINT32 width = 0, height = 0, rateNum = 0, rateDen = 0;
 };
 
-// Set while a device is being opened. DirectShow lists Frame Server cameras, including our
-// own virtual cameras, and binding one of those from inside Frame Server activates another
-// of our sources on another thread, which opens a device again, without end. Opening by
-// path avoids that; this guard stops it if anything else triggers it.
+// Devices being opened in this process right now. DirectShow lists Frame Server cameras,
+// including our own virtual cameras, and reading one of those from inside Frame Server
+// activates another of our sources on another thread, which opens a device again, without
+// end. Opening by path avoids that; this cap stops it if anything else triggers it, while
+// still allowing a few genuinely concurrent opens.
 static std::atomic<int> g_opening{0};
+static const int kMaxConcurrentOpens = 4;
 
 struct OpeningScope {
   OpeningScope() { g_opening++; }
@@ -146,6 +148,8 @@ static HRESULT FindDeviceFilter(const std::wstring &devicePath, IBaseFilter **fi
   if (SUCCEEDED(hr)) return S_OK;
   Log(L"Direct bind failed (0x%08X), listing devices", hr);
 
+  // Match monikers by display name: reading their property bags would activate virtual cameras.
+
   ComPtr<ICreateDevEnum> devEnum;
   RETURN_IF_FAILED(CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&devEnum)));
   ComPtr<IEnumMoniker> monikers;
@@ -156,15 +160,11 @@ static HRESULT FindDeviceFilter(const std::wstring &devicePath, IBaseFilter **fi
   }
   ComPtr<IMoniker> moniker;
   while (monikers->Next(1, &moniker, nullptr) == S_OK) {
-    ComPtr<IPropertyBag> bag;
-    VARIANT value; VariantInit(&value);
-    if (SUCCEEDED(moniker->BindToStorage(nullptr, nullptr, IID_PPV_ARGS(&bag))) &&
-        SUCCEEDED(bag->Read(L"DevicePath", &value, nullptr)) && value.vt == VT_BSTR &&
-        _wcsicmp(value.bstrVal, devicePath.c_str()) == 0) {
-      VariantClear(&value);
-      return moniker->BindToObject(nullptr, nullptr, IID_PPV_ARGS(filter));
-    }
-    VariantClear(&value);
+    LPOLESTR display = nullptr;
+    bool match = SUCCEEDED(moniker->GetDisplayName(context.Get(), nullptr, &display)) && display &&
+                 _wcsicmp(display, name.c_str()) == 0;
+    CoTaskMemFree(display);
+    if (match) return moniker->BindToObject(nullptr, nullptr, IID_PPV_ARGS(filter));
     moniker.Reset();
   }
   Log(L"Device not found: %s", devicePath.c_str());
@@ -519,7 +519,6 @@ private:
   }
 
   HRESULT StartCaptureLocked() {
-    if (m_capture) return S_OK;
     ComPtr<IMFMediaTypeHandler> handler;
     ComPtr<IMFMediaType> current;
     RETURN_IF_FAILED(m_descriptor->GetMediaTypeHandler(&handler));
@@ -538,6 +537,12 @@ private:
       }
     }
     if (!chosen) { Log(L"Current media type is not one of ours"); return MF_E_INVALIDMEDIATYPE; }
+    if (m_capture) {
+      if (chosen == m_format) return S_OK;
+      StopCaptureLocked();  // the app picked another format: restart in it
+      if (m_shutdown) return MF_E_SHUTDOWN;
+      if (m_capture) return S_OK;  // another thread started one while we were stopping
+    }
     if (!m_allocator) {  // running outside Frame Server
       ComPtr<IMFVideoSampleAllocatorEx> own;
       RETURN_IF_FAILED(MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&own)));
@@ -558,13 +563,13 @@ private:
   }
 
   void StopCaptureLocked() {
-    if (m_capture) {
-      Capture *capture = m_capture.Get();
+    // Take the capture first, so another thread stopping at the same time finds none.
+    ComPtr<Capture> capture = std::move(m_capture);
+    if (capture) {
       // The streaming thread takes m_lock in OnFrame; stop the graph without holding it.
       m_lock.unlock();
       capture->Stop();
       m_lock.lock();
-      m_capture.Reset();
       Log(L"Capture stopped (%llu delivered, %llu dropped)", m_delivered, m_dropped);
     }
     m_requests.clear();
@@ -592,8 +597,13 @@ class MediaSource : public RuntimeClass<RuntimeClassFlags<ClassicCom>,
                                         ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>,
                                         IMFGetService, IKsControl, IMFSampleAllocatorControl> {
 public:
+  bool IsShutdown() {
+    std::lock_guard<std::mutex> lock(m_lock);
+    return m_shutdown;
+  }
+
   HRESULT Initialize(const std::wstring &devicePath, IMFAttributes *activateAttributes) {
-    if (g_opening) { Log(L"Refusing nested activation"); return HRESULT_FROM_WIN32(ERROR_POSSIBLE_DEADLOCK); }
+    if (g_opening >= kMaxConcurrentOpens) { Log(L"Refusing runaway nested activation"); return HRESULT_FROM_WIN32(ERROR_POSSIBLE_DEADLOCK); }
     Log(L"Opening %s", devicePath.c_str());
     RETURN_IF_FAILED(MFCreateEventQueue(&m_queue));
     RETURN_IF_FAILED(MFCreateAttributes(&m_attributes, 4));
@@ -792,7 +802,7 @@ public:
 
   IFACEMETHODIMP ActivateObject(REFIID riid, void **object) override {
     std::lock_guard<std::mutex> lock(m_lock);
-    if (!m_source) {
+    if (!m_source || m_source->IsShutdown()) {  // the caller may have shut it down directly
       auto source = Make<MediaSource>();
       if (!source) return E_OUTOFMEMORY;
       HRESULT hr = source->Initialize(m_devicePath, m_store.Get());

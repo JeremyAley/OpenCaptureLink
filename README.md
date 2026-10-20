@@ -123,8 +123,8 @@ Run `.\OpenCaptureLink.ps1 -Remove all` from an administrator PowerShell, or unc
 everything in the window and click **Apply** (for both link types). Then delete the folder.
 
 Removing the last Media Foundation link also deletes `C:\Program Files\OpenCaptureLink`. If
-an app still has the DLL loaded, the folder stays until you restart Windows; delete it then,
-along with `C:\ProgramData\OpenCaptureLink`.
+an app still has the DLL loaded, Windows deletes it at the next restart. The log folder,
+`C:\ProgramData\OpenCaptureLink`, stays; delete it if you like.
 
 ## Building the camera DLL
 
