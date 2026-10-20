@@ -32,12 +32,17 @@ Download the latest release and unzip it anywhere.
 
 ### Window
 
-Double-click **`OpenCaptureLink.cmd`** and accept the administrator prompt. Check the
-devices you want linked and click **Apply**.
+Double-click **`OpenCaptureLink.cmd`** and accept the administrator prompt. Pick a link for
+each device you want and click **Apply**:
 
-Leave **DirectShow (Recommended)** selected unless the app you want still can't see the
-device. **Media Foundation** makes a virtual camera instead (see below); apps list it as
-`<device> (Direct) (Windows Virtual Camera)`.
+- **DirectShow (Recommended):** opens the real device directly, with no extra delay. Use this
+  unless the app you want still can't see the device.
+- **Media Foundation:** a virtual camera, for apps that only use Media Foundation (see
+  below). Apps list it as `<device> (Direct) (Windows Virtual Camera)`.
+- **Off:** no link.
+
+Each device has one link at a time, so you can give one capture card a DirectShow link and
+another a Media Foundation link, for example to use them in different apps.
 
 Then restart the app that should see them. For NVIDIA Broadcast, fully quit it from the
 system tray; closing the window only hides it. Pick the `(Direct)` device as your camera.
@@ -53,6 +58,9 @@ From an administrator PowerShell, in the unzipped folder:
 .\OpenCaptureLink.ps1 -Remove all            # remove links (number, name or all)
 .\OpenCaptureLink.ps1 -Add 2 -Type MediaFoundation   # Media Foundation link instead
 ```
+
+Adding one type of link replaces the device's other type. `-Remove` removes both types
+unless you add `-Type`.
 
 Add `-Scope CurrentUser` to work without administrator rights. Links are then only for your
 account, and some apps, including NVIDIA Broadcast, don't see them.
@@ -99,6 +107,15 @@ though DirectShow can. A Media Foundation link works around that:
 Media Foundation links need Windows 11 and administrator rights, and are always for all
 users.
 
+They work with any device that works in DirectShow apps, with these limits:
+
+- Only uncompressed **NV12 and YUY2** formats are offered. Many USB capture sticks and
+  webcams offer their higher resolutions only as MJPEG; those modes don't appear yet.
+- Older analog or TV capture cards that need an input chosen (composite, S-Video) aren't
+  supported. HDMI capture cards and webcams don't need that.
+- Most devices don't need a Media Foundation link at all: if a device already opens in
+  Media Foundation apps, a DirectShow link (or no link) is enough.
+
 ## Compatibility
 
 - **Works with** apps that list DirectShow cameras. NVIDIA Broadcast is tested; most
@@ -113,14 +130,15 @@ Tested on Windows 11 with:
 
 | Device | App | Result |
 | --- | --- | --- |
-| AVerMedia Live Gamer DUO (GC570D), both inputs | NVIDIA Broadcast | Works |
+| AVerMedia Live Gamer DUO (GC570D), both inputs | NVIDIA Broadcast (DirectShow link) | Works |
+| AVerMedia Live Gamer DUO (GC570D), input with a signal | Media Foundation test reader (Media Foundation link) | 1080p60, no dropped frames, also with the other input streaming |
 
 Tried it with other hardware? Open an issue or pull request to add it to the table.
 
 ## Uninstall
 
-Run `.\OpenCaptureLink.ps1 -Remove all` from an administrator PowerShell, or uncheck
-everything in the window and click **Apply** (for both link types). Then delete the folder.
+Run `.\OpenCaptureLink.ps1 -Remove all` from an administrator PowerShell, or set every
+device to **Off** in the window and click **Apply**. Then delete the folder.
 
 Removing the last Media Foundation link also deletes `C:\Program Files\OpenCaptureLink`. If
 an app still has the DLL loaded, Windows deletes it at the next restart. The log folder,
