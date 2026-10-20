@@ -299,16 +299,23 @@ function Show-Gui([string]$snapshot) {
 switch ($PSCmdlet.ParameterSetName) {
   'Gui' {
     # Elevate for all-users changes; if the prompt is declined, open with "Just me" instead.
+    # PowerShell hides its own console via its -WindowStyle argument. Passing -WindowStyle to
+    # Start-Process instead would hide the first window the new process shows: ours.
     if (-not $Snapshot -and -not (Test-Admin) -and $Scope -eq 'AllUsers') {
       try {
-        Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList @(
-          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"", '-Gui')
+        Start-Process powershell.exe -Verb RunAs -ArgumentList @(
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"", '-Gui')
         return
       } catch {
         $Scope = 'CurrentUser'
       }
     }
-    Show-Gui $Snapshot
+    try {
+      Show-Gui $Snapshot
+    } catch {
+      Add-Type -AssemblyName System.Windows.Forms
+      [void][System.Windows.Forms.MessageBox]::Show("OpenCaptureLink could not start:`n`n$($_.Exception.Message)", 'OpenCaptureLink', 'OK', 'Error')
+    }
   }
   'Add' {
     Assert-CanWrite $Scope
